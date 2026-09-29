@@ -2,6 +2,17 @@ import z from '@deepseek-ai/schemastery'
 
 export const SETTINGS_NS = 'directorx'
 
+/**
+ * Live settings reference for one volatile config leaf. 0.2.x projects the
+ * settings form from the entry's own volatile config, and a volatile leaf is a
+ * reference rather than a value: read it with `get()` to see what is committed.
+ * Declared structurally because the published cordis type surface does not
+ * re-export the runtime's `Volatile`.
+ */
+export interface Volatile<T> {
+  get(): T
+}
+
 export type CapabilityMode =
   | 'deepseek-chat'
   | 'openai-chat'
@@ -69,33 +80,98 @@ export const AUDIO_MODES = ['openai-tts', 'generic-rest', 'mock'] as const
 
 function modeAuth() {
   return z.object({
-    klingAk: z.string().role('secret').default('').description('Kling 可灵 AccessKey（JWT 签名用，仅 kling 模式需要）。'),
-    klingSk: z.string().role('secret').default('').description('Kling 可灵 SecretKey（JWT 签名用，仅 kling 模式需要）。'),
-    runwayVersion: z.string().default('').description('Runway API 版本头（如 2024-11-06），留空则不发送该头。'),
+    klingAk: z.string().role('secret').default('').description('Kling 可灵 AccessKey（JWT 签名用，仅 kling 模式需要）。').volatile(),
+    klingSk: z.string().role('secret').default('').description('Kling 可灵 SecretKey（JWT 签名用，仅 kling 模式需要）。').volatile(),
+    runwayVersion: z.string().default('').description('Runway API 版本头（如 2024-11-06），留空则不发送该头。').volatile(),
   })
 }
 
 function capability(modes: readonly string[], mode: string, baseURL: string, model: string, resolution = '1K') {
   return z.object({
-    enabled: z.boolean().default(true).description('Register and expose this capability to the agent.'),
-    mode: z.union(modes as unknown as string[]).default(mode).description('Protocol used to reach the provider.'),
-    baseURL: z.string().default(baseURL).description('Base URL, e.g. https://api.openai.com/v1.'),
-    apiKey: z.string().role('secret').default('').description('API key; empty means local endpoint or env fallback.'),
-    model: z.string().default(model).description('Model id.'),
-    resolution: z.string().default(resolution).description('Provider-specific output tier.'),
+    enabled: z.boolean().default(true).description('Register and expose this capability to the agent.').volatile(),
+    mode: z.union(modes as unknown as string[]).default(mode).description('Protocol used to reach the provider.').volatile(),
+    baseURL: z.string().default(baseURL).description('Base URL, e.g. https://api.openai.com/v1.').volatile(),
+    apiKey: z.string().role('secret').default('').description('API key; empty means local endpoint or env fallback.').volatile(),
+    model: z.string().default(model).description('Model id.').volatile(),
+    resolution: z.string().default(resolution).description('Provider-specific output tier.').volatile(),
     auth: modeAuth(),
   })
 }
 
 export const DirectorxSettings = z.object({
-  outputDir: z.string().default('directorx_output').description('Directory under the current working directory for downloaded media.'),
-  timeoutMs: z.number().step(1).min(1_000).max(3_600_000).default(120_000).description('HTTP timeout for one provider request.'),
-  pollIntervalMs: z.number().step(1).min(500).max(60_000).default(5_000).description('Async task polling interval.'),
-  maxPollAttempts: z.number().step(1).min(1).max(2_000).default(360).description('Maximum async task polling attempts.'),
-  persona: z.union(['成片']).default('成片').description('成片 persona：导演角度分析，积极调用知识库与 skill。'),
-  initiative: z.union(['严格', '自动', '协同']).default('协同').description('严格：多确认、不生成、二到四个提示词。自动：预算内直接执行生成。协同：提示词和占位，用户审阅后执行生成。'),
+  outputDir: z.string().default('directorx_output').description('Directory under the current working directory for downloaded media.').volatile(),
+  timeoutMs: z.number().step(1).min(1_000).max(3_600_000).default(120_000).description('HTTP timeout for one provider request.').volatile(),
+  pollIntervalMs: z.number().step(1).min(500).max(60_000).default(5_000).description('Async task polling interval.').volatile(),
+  maxPollAttempts: z.number().step(1).min(1).max(2_000).default(360).description('Maximum async task polling attempts.').volatile(),
+  persona: z.union(['成片']).default('成片').description('成片 persona：导演角度分析，积极调用知识库与 skill。').volatile(),
+  initiative: z.union(['严格', '自动', '协同']).default('协同').description('严格：多确认、不生成、二到四个提示词。自动：预算内直接执行生成。协同：提示词和占位，用户审阅后执行生成。').volatile(),
   vision: capability(VISION_MODES, 'deepseek-chat', 'https://api.deepseek.com', 'deepseek-v4-flash-vision-exp'),
   image: capability(IMAGE_MODES, 'openai-images', 'https://api.modelverse.cn/v1', 'gpt-image-2'),
   video: capability(VIDEO_MODES, 'modelverse-tasks', 'https://api.modelverse.cn/v1', 'doubao-seedance-2-0-260128', '2K'),
   audio: capability(AUDIO_MODES, 'openai-tts', 'https://api.modelverse.cn/v1', 'qwen3-tts-flash'),
 })
+
+/** Per-mode credential bag, live: every leaf is a volatile settings reference. */
+export interface ModeAuthConfig {
+  klingAk: Volatile<string>
+  klingSk: Volatile<string>
+  runwayVersion: Volatile<string>
+}
+
+/** One capability's live settings; mirrors {@link CapabilitySettings} field for field. */
+export interface CapabilityConfig {
+  enabled: Volatile<boolean>
+  mode: Volatile<CapabilityMode>
+  baseURL: Volatile<string>
+  apiKey: Volatile<string>
+  model: Volatile<string>
+  resolution: Volatile<string>
+  auth: ModeAuthConfig
+}
+
+/**
+ * Config injected into `apply` by the Loader for the `directorx` entry. Fields
+ * are volatile references, so a settings edit commits in place: read through
+ * `.get()` and the same object always yields the current values.
+ */
+export interface DirectorxConfig {
+  outputDir: Volatile<string>
+  timeoutMs: Volatile<number>
+  pollIntervalMs: Volatile<number>
+  maxPollAttempts: Volatile<number>
+  persona: Volatile<'成片'>
+  initiative: Volatile<InitiativeMode>
+  vision: CapabilityConfig
+  image: CapabilityConfig
+  video: CapabilityConfig
+  audio: CapabilityConfig
+}
+
+/** Detach a live config into the plain snapshot the tools and providers consume. */
+export function configSnapshot(config: DirectorxConfig): DirectorxSettings {
+  const cap = (source: CapabilityConfig): CapabilitySettings => ({
+    enabled: source.enabled.get(),
+    mode: source.mode.get(),
+    baseURL: source.baseURL.get(),
+    apiKey: source.apiKey.get(),
+    model: source.model.get(),
+    resolution: source.resolution.get(),
+    auth: {
+      klingAk: source.auth.klingAk.get(),
+      klingSk: source.auth.klingSk.get(),
+      runwayVersion: source.auth.runwayVersion.get(),
+    },
+  })
+  return {
+    outputDir: config.outputDir.get(),
+    timeoutMs: config.timeoutMs.get(),
+    pollIntervalMs: config.pollIntervalMs.get(),
+    maxPollAttempts: config.maxPollAttempts.get(),
+    persona: config.persona.get(),
+    initiative: config.initiative.get(),
+    vision: cap(config.vision),
+    image: cap(config.image),
+    video: cap(config.video),
+    audio: cap(config.audio),
+  }
+}

@@ -1,12 +1,11 @@
 import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
-import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import type {} from '@deepseek-ai/dsh-settings'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-skill'
 import type {} from '@deepseek-ai/dsh-system-prompt'
-import { DirectorxSettings, SETTINGS_NS, type DirectorxSettings as DirectorxSettingsType } from './config.ts'
+import { DirectorxSettings, SETTINGS_NS, configSnapshot, type DirectorxConfig, type DirectorxSettings as DirectorxSettingsType } from './config.ts'
 import { corpus } from './corpus.ts'
 import { registerCanvasCraftRoute, registerCanvasIntentRoute, registerCanvasResetRoute, registerCanvasRestoreRoute, registerCanvasRoute, registerCanvasSnapshotsRoute, registerCharactersRoute, registerMediaEditsRoute, registerMediaListRoute, registerMediaRoute, registerMediaTasksRoute, registerProjectsRoute, registerProposalsRoute, registerProposalUpdateRoute, registerStudioRoute, registerVendorRoute } from './media-server.ts'
 import { registerCanvasGenerateRoute } from './canvas-job.ts'
@@ -33,20 +32,43 @@ export { runVision, mockVision } from './providers/vision.ts'
 export const name = 'directorx'
 export const inject = ['tools', 'skills', 'systemPrompt', 'settings', 'llm']
 
-export function apply(ctx: Context): void {
+/** 0.2.x settings are config-derived: the editable fields are the volatile ones in this schema. */
+export const Config = DirectorxSettings
+
+export function apply(ctx: Context, config: DirectorxConfig): void {
   corpus.setRoot(fileURLToPath(new URL('../knowledge/', import.meta.url)))
 
-  const namespace = SETTINGS_NS as SettingsNamespace
-  const scope = ctx.settings.register(namespace, DirectorxSettings, {
-    applies: 'live',
-    validate(value) {
-      for (const capability of [value.vision, value.image, value.video, value.audio]) {
-        if (capability.enabled && capability.mode !== 'mock' && capability.baseURL.trim() === '') {
-          throw new Error('An enabled DirectorX capability needs a non-empty Base URL (or choose mock mode).')
-        }
+  // The DSH runtime's context carries the event bus and the owning fiber; the
+  // published cordis type surface does not describe them here, so read them
+  // structurally the same way this file already reaches `llm`.
+  const host = ctx as Context & {
+    fiber?: { entry?: { options?: { id?: string } } }
+    on(name: string, listener: (...args: never[]) => unknown): () => boolean
+    logger?: { warn?(format: unknown, ...rest: unknown[]): void }
+  }
+
+  // Nothing is registered with the settings service any more: it projects a form
+  // from this entry's own volatile Config. `read()` detaches the live references
+  // into the plain snapshot every tool and provider already consumes, so the
+  // rest of the plugin keeps reading an immutable `DirectorxSettings`.
+  const read = (): DirectorxSettingsType => configSnapshot(config)
+
+  // The schema validates shape at write time, but this rule spans four fields,
+  // so it is reported instead of refusing to activate the whole plugin.
+  const warnUnconfigured = (value: DirectorxSettingsType): void => {
+    for (const [capability, settings] of Object.entries({ vision: value.vision, image: value.image, video: value.video, audio: value.audio })) {
+      if (settings.enabled && settings.mode !== 'mock' && settings.baseURL.trim() === '') {
+        host.logger?.warn?.('directorx: %s is enabled with an empty Base URL; choose mock mode or set one.', capability)
       }
-    },
-  })
+    }
+  }
+
+  // Writes go through the settings service, keyed by this entry's id — the same
+  // namespace the WebUI cards mutate. `SETTINGS_NS` is the bundle's shipped id.
+  const settingsFace = ctx.get('settings') as {
+    update(ns: string, patch: object, expectedRevision?: number): Promise<void>
+  } | undefined
+  const settingsNamespace = host.fiber?.entry?.options?.id ?? SETTINGS_NS
 
   // Host serves every registered settings namespace (`settings.describe`).
   // Also register the four capability profiles as configurable providers so
@@ -71,9 +93,9 @@ export function apply(ctx: Context): void {
   let disposePrompt: (() => void) | undefined
 
   const applyCapability = async (capability: AdapterCapability, patch: Partial<CapabilitySettings>): Promise<void> => {
-    const current = scope.get() as DirectorxSettingsType
-    const prev = current[capability]
-    await scope.update({
+    if (settingsFace === undefined) throw new Error('directorx: the settings service is unavailable, so provider configuration cannot be persisted.')
+    const prev = read()[capability]
+    await settingsFace.update(settingsNamespace, {
       [capability]: {
         ...prev,
         ...patch,
@@ -89,32 +111,40 @@ export function apply(ctx: Context): void {
     disposePrompt = registerSystemPrompt(ctx, settings)
   }
 
-  sync(scope.get())
-  ctx.effect(() => registerStageRoutes(ctx, () => scope.get()), 'directorx director stage route')
+  // Volatile edits commit into the running fiber and are dispatched here, so a
+  // settings write re-registers the tools without remounting the plugin.
+  const refresh = (): void => {
+    const settings = read()
+    warnUnconfigured(settings)
+    sync(settings)
+  }
+
+  refresh()
+  ctx.effect(() => registerStageRoutes(ctx, () => read()), 'directorx director stage route')
   ctx.effect(() => registerEditRoutes(ctx), 'directorx edit stage route')
-  ctx.effect(() => scope.watch(sync), 'directorx settings watch')
-  ctx.effect(() => registerMediaRoute(ctx, () => scope.get().outputDir), 'directorx media route')
-  ctx.effect(() => registerMediaEditsRoute(ctx, () => scope.get().outputDir), 'directorx media edits route')
-  ctx.effect(() => registerMediaTasksRoute(ctx, () => scope.get().outputDir), 'directorx media tasks route')
-  ctx.effect(() => registerMediaListRoute(ctx, () => scope.get().outputDir), 'directorx media list route')
+  ctx.effect(() => host.on('loader/volatile-update', refresh), 'directorx settings watch')
+  ctx.effect(() => registerMediaRoute(ctx, () => read().outputDir), 'directorx media route')
+  ctx.effect(() => registerMediaEditsRoute(ctx, () => read().outputDir), 'directorx media edits route')
+  ctx.effect(() => registerMediaTasksRoute(ctx, () => read().outputDir), 'directorx media tasks route')
+  ctx.effect(() => registerMediaListRoute(ctx, () => read().outputDir), 'directorx media list route')
   ctx.effect(() => registerProjectsRoute(ctx), 'directorx projects route')
-  ctx.effect(() => registerCanvasRoute(ctx, () => scope.get().outputDir), 'directorx canvas route')
-  ctx.effect(() => registerCanvasResetRoute(ctx, () => scope.get().outputDir), 'directorx canvas reset route')
-  ctx.effect(() => registerCanvasSnapshotsRoute(ctx, () => scope.get().outputDir), 'directorx canvas snapshots route')
-  ctx.effect(() => registerCanvasRestoreRoute(ctx, () => scope.get().outputDir), 'directorx canvas restore route')
-  ctx.effect(() => registerCanvasIntentRoute(ctx, () => scope.get().outputDir), 'directorx canvas intent route')
-  ctx.effect(() => registerCanvasCraftRoute(ctx, () => scope.get().outputDir), 'directorx canvas craft route')
-  ctx.effect(() => registerCanvasGenerateRoute(ctx, () => scope.get() as DirectorxSettingsType), 'directorx canvas generate route')
-  ctx.effect(() => registerCharactersRoute(ctx, () => scope.get().outputDir), 'directorx characters route')
-  ctx.effect(() => registerStudioRoute(ctx, () => scope.get().outputDir), 'directorx studio route')
+  ctx.effect(() => registerCanvasRoute(ctx, () => read().outputDir), 'directorx canvas route')
+  ctx.effect(() => registerCanvasResetRoute(ctx, () => read().outputDir), 'directorx canvas reset route')
+  ctx.effect(() => registerCanvasSnapshotsRoute(ctx, () => read().outputDir), 'directorx canvas snapshots route')
+  ctx.effect(() => registerCanvasRestoreRoute(ctx, () => read().outputDir), 'directorx canvas restore route')
+  ctx.effect(() => registerCanvasIntentRoute(ctx, () => read().outputDir), 'directorx canvas intent route')
+  ctx.effect(() => registerCanvasCraftRoute(ctx, () => read().outputDir), 'directorx canvas craft route')
+  ctx.effect(() => registerCanvasGenerateRoute(ctx, () => read()), 'directorx canvas generate route')
+  ctx.effect(() => registerCharactersRoute(ctx, () => read().outputDir), 'directorx characters route')
+  ctx.effect(() => registerStudioRoute(ctx, () => read().outputDir), 'directorx studio route')
   ctx.effect(() => registerVendorRoute(ctx), 'directorx vendor assets route')
-  ctx.effect(() => registerProposalsRoute(ctx, () => scope.get().outputDir), 'directorx proposals route')
-  ctx.effect(() => registerProposalUpdateRoute(ctx, () => scope.get().outputDir), 'directorx proposal update route')
-  ctx.effect(() => registerSettingsTestRoute(ctx, () => scope.get() as DirectorxSettingsType), 'directorx settings test route')
-  ctx.effect(() => registerAdaptersRoute(ctx, () => scope.get().outputDir), 'directorx adapters route')
-  ctx.effect(() => registerMcpRoute(ctx, () => scope.get() as DirectorxSettingsType), 'directorx mcp route')
+  ctx.effect(() => registerProposalsRoute(ctx, () => read().outputDir), 'directorx proposals route')
+  ctx.effect(() => registerProposalUpdateRoute(ctx, () => read().outputDir), 'directorx proposal update route')
+  ctx.effect(() => registerSettingsTestRoute(ctx, () => read()), 'directorx settings test route')
+  ctx.effect(() => registerAdaptersRoute(ctx, () => read().outputDir), 'directorx adapters route')
+  ctx.effect(() => registerMcpRoute(ctx, () => read()), 'directorx mcp route')
   ctx.effect(() => registerSubagentSetup(ctx), 'directorx subagent setup')
-  ctx.effect(() => registerDirectorxCommands(ctx, () => scope.get().outputDir), 'directorx commands')
+  ctx.effect(() => registerDirectorxCommands(ctx, () => read().outputDir), 'directorx commands')
 
   // System prompt and child-agent guidance are installed through DSH's native seams.
   // registerSubagentSetup consumes the same runtime preset as registerSystemPrompt;
